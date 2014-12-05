@@ -57,6 +57,10 @@ import (
     "syscall"
     "time"
     "encoding/base64"
+    "code.google.com/p/gopacket"
+    "code.google.com/p/gopacket/pcap"
+    "code.google.com/p/gopacket/layers"
+    "sync"
 )
 
 const VERSION = "1.1"
@@ -85,18 +89,22 @@ type reverseLookupCache struct {
   hostnames map[string]*cacheEntry
   keys []string
   next int
+  mutex *sync.Mutex
 }
 func NewReverseLookupCache() *reverseLookupCache {
     return &reverseLookupCache{
         hostnames: make(map[string]*cacheEntry),
         keys: make([]string,65536),
+        mutex: &sync.Mutex{},
     }
 }
 func (c *reverseLookupCache) lookup(ipv4 string) string {
+    c.mutex.Lock()
     hit := c.hostnames[ipv4]
     if hit != nil {
         if hit.expires.After(time.Now()) {
             log.Debugf("lookup(): CACHE_HIT")
+            c.mutex.Unlock()
             return hit.hostname
         } else {
             log.Debugf("lookup(): CACHE_EXPIRED")
@@ -105,13 +113,16 @@ func (c *reverseLookupCache) lookup(ipv4 string) string {
     } else {
         log.Debugf("lookup(): CACHE_MISS")
     }
+    c.mutex.Unlock()
     return ""
 }
-func (c *reverseLookupCache) store(ipv4, hostname string) {
+func (c *reverseLookupCache) store(ipv4, hostname string, TTL uint32) {
+    c.mutex.Lock()
     delete(c.hostnames, c.keys[c.next])
     c.keys[c.next] = ipv4
     c.next = (c.next + 1) & 65535
-    c.hostnames[ipv4] = &cacheEntry{hostname: hostname, expires: time.Now().Add(time.Hour)}
+    c.hostnames[ipv4] = &cacheEntry{hostname: hostname, expires: time.Now().Add(time.Duration(TTL)*time.Second)}
+    c.mutex.Unlock()
 }
 var gReverseLookupCache *reverseLookupCache
 
@@ -136,7 +147,7 @@ func init() {
         fmt.Fprintf(os.Stdout, "  -d=DIRECTS       List of IP addresses that the proxy should send to directly instead of\n")
         fmt.Fprintf(os.Stdout, "                   to the upstream proxies (e.g., -d 10.1.1.1,10.1.1.2)\n")
         fmt.Fprintf(os.Stdout, "  -r=1             Enable relaying of HTTP redirects from upstream to clients\n")
-        fmt.Fprintf(os.Stdout, "  -h=1             Enable reverse lookups of destination IP address and use hostname in CONNECT\n")
+        fmt.Fprintf(os.Stdout, "  -R=1             Enable reverse lookups of destination IP address and use hostname in CONNECT\n")
         fmt.Fprintf(os.Stdout, "                   request instead of the numeric IP if available. A local DNS server could be\n")
         fmt.Fprintf(os.Stdout, "                   configured to provide a reverse lookup of the forward lookup responses seen.\n")
         fmt.Fprintf(os.Stdout, "  -v=1             Print debug information to logfile %s\n", DEFAULTLOG)
@@ -175,7 +186,7 @@ func init() {
     flag.StringVar(&gMemProfile,      "m", "", "Write mem profile to file")
     flag.IntVar(   &gVerbosity,       "v", 0,  "Control level of logging. v=1 results in debugging info printed to the log.\n")
     flag.IntVar(   &gClientRedirects, "r", 0,  "Should we relay HTTP redirects from upstream proxies? -r=1 if we should.\n")
-    flag.IntVar(   &gReverseLookups,  "h", 0,  "Should we perform reverse lookups of destination IPs and use hostnames? -h=1 if we should.\n")
+    flag.IntVar(   &gReverseLookups,  "R", 0,  "Should we perform reverse lookups of destination IPs and use hostnames? -R=1 if we should.\n")
 
     dirFuncs := buildDirectors(gDirects)
     director = getDirector(dirFuncs)
@@ -314,7 +325,7 @@ func main() {
     dirFuncs := buildDirectors(gDirects)
     director = getDirector(dirFuncs)
 
-    if gReverseLookups == 1 {
+    if gReverseLookups > 0 {
         gReverseLookupCache = NewReverseLookupCache()
     }
 
@@ -336,6 +347,23 @@ func main() {
     }
     defer listener.Close()
     log.Infof("Listening for connections on %v\n", listener.Addr())
+
+    if gReverseLookups == 2 { // monitor DNS traffic to build reverse-forward-lookup-cache
+        go func() {
+            log.Infof("attempting to capture DNS packets\n")
+            if handle, err := pcap.OpenLive("eth0", 1600, true, 0); err != nil { // TODO: interface parameter (or all interfaces)
+                panic(err)
+            } else if err := handle.SetBPFFilter("udp and port 53"); err != nil {
+                panic(err)
+            } else {
+                packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
+                for packet := range packetSource.Packets() {
+                    handlePacket(packet)
+                }
+            }
+            log.Infof("no longer capturing DNS packets\n")
+        } ()
+    }
 
     for {
         conn, err := listener.AcceptTCP()
@@ -566,14 +594,14 @@ func handleProxyConnection(clientConn *net.TCPConn, ipv4 string, port uint16) {
         headerXFF = fmt.Sprintf("X-Forwarded-For: %s\r\n", host)
     }
 
-    if gReverseLookups == 1 {
+    if gReverseLookups > 0 {
         hostname := gReverseLookupCache.lookup(ipv4)
         if hostname != "" {
             ipv4 = hostname
-        } else {
+        } else if gReverseLookups == 1 {
             names, err := net.LookupAddr(ipv4)
             if err == nil && len(names) > 0 {
-                gReverseLookupCache.store(ipv4,names[0])
+                gReverseLookupCache.store(ipv4,names[0],3600) // can net.LookupAddr give a real TTL?
                 ipv4 = names[0]
             }
         }
@@ -670,6 +698,38 @@ func handleConnection(clientConn *net.TCPConn) {
             return
     }
     handleProxyConnection(clientConn, ipv4, port)
+}
+
+func handlePacket(packet gopacket.Packet) {
+    dnsLayer := packet.Layer(layers.LayerTypeDNS)
+     
+    if dnsLayer == nil {
+        return
+    }
+            
+    dns_data := dnsLayer.(*layers.DNS)
+
+    if len(dns_data.Answers) == 0 {
+        return
+    }
+
+    if len(dns_data.Questions) == 0 || dns_data.Questions[0].Type != layers.DNSTypeA { // always first question?
+        return
+    }
+
+    hostname := string(dns_data.Questions[0].Name)
+    if hostname == "" {
+        return
+    }
+
+    for _,dns_answer := range dns_data.Answers {
+        if dns_answer.Type == layers.DNSTypeA {
+            log.Debugf("Host %s TTL %d has A %s\n", dns_answer.Name, dns_answer.TTL, dns_answer.IP.String()) // The associated A records resolved
+            gReverseLookupCache.store(dns_answer.IP.String(), hostname, dns_answer.TTL)
+        } else if dns_answer.Type == layers.DNSTypeCNAME {
+            log.Debugf("Host %s TTL %d has CNAME %s\n", dns_answer.Name, dns_answer.TTL, dns_answer.CNAME)
+        }
+    }
 }
 
 // from pkg/net/parse.go
